@@ -80,7 +80,6 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
                                        (config.MORPH_KERNEL, config.MORPH_KERNEL))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    # 限定到箱子掩膜内，且掩膜内缩以排除箱子边界强边缘
     center_s = None
     short_side_s = None
     long_side_s = None
@@ -94,7 +93,6 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
                                 (small.shape[1], small.shape[0]),
                                 interpolation=cv2.INTER_NEAREST)
         edges = cv2.bitwise_and(edges, small_mask)
-        # 箱子中心与边长（降采样坐标系）
         _, _, short_side, long_side = _box_long_axis(box["rect"])
         cx, cy = box["rect"][0]
         center_s = (cx * s, cy * s)
@@ -112,7 +110,6 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
     if lines is None:
         return None
 
-    # 收集所有通过筛选的候选线
     candidates = []
     for ln in lines[:, 0, :]:
         x1, y1, x2, y2 = ln
@@ -120,11 +117,9 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
         L = math.hypot(dx, dy)
         if L < 1:
             continue
-        # 硬约束：缝隙方向固定为竖直，必须近竖直
         v_ang = _near_vertical_angle(dx, dy)
         if v_ang > config.SEAM_VERTICAL_TOL_DEG:
             continue
-        # 经过箱子中心附近（胶带在箱顶正中）
         if center_s is not None and short_side_s is not None:
             d = _point_line_dist(center_s[0], center_s[1],
                                  x1, y1, x2, y2)
@@ -135,7 +130,6 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
     if not candidates:
         return None
 
-    # 时序锁定：若有上一帧缝隙，优先用“中点附近 + 方向一致”的候选段
     used = candidates
     if prev_skel is not None and long_side_s is not None:
         (px1, py1), (px2, py2) = prev_skel
@@ -155,17 +149,15 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
         if len(locked) >= 1:
             used = locked
 
-    # 鲁棒中线：长度加权方向 + 候选中点中位数位置，再沿方向延伸到箱子边界
     skel_small = _robust_line(used, small_mask)
     if skel_small is None:
         return None
     (sx1, sy1), (sx2, sy2) = skel_small
+    (sx1, sy1), (sx2, sy2) = _refine_skeleton_to_crease(enhanced, (sx1, sy1), (sx2, sy2))
     ang = _near_vertical_angle(sx2 - sx1, sy2 - sy1)
-    # 在降采样图上做边缘定位
     edge1_s, edge2_s, width_s = _locate_edges(enhanced, (sx1, sy1), (sx2, sy2))
     if edge1_s is None:
         return None
-    # 映射回全分辨率
     p1 = (sx1 * inv, sy1 * inv)
     p2 = (sx2 * inv, sy2 * inv)
     edge1 = (edge1_s[0] * inv, edge1_s[1] * inv)
@@ -180,15 +172,9 @@ def detect_seam(color_bgr, box=None, prev_skel=None):
 
 
 def _robust_line(cands, mask):
-    """把多条共线候选段聚合成一条鲁棒中线，并沿方向延伸到掩膜边界。
-
-    cands: [(x1,y1,x2,y2,L), ...]（降采样坐标）
-    mask: 箱子内缩掩膜（降采样），用于延伸端点；None 时退化为候选段外接范围。
-    返回 ((x1,y1),(x2,y2)) 或 None。
-    """
+    """把多条共线候选段聚合成一条鲁棒中线，并沿方向延伸到掩膜边界。"""
     if not cands:
         return None
-    # 长度加权方向
     total_w = sum(c[4] for c in cands)
     dx = sum((c[2] - c[0]) * c[4] for c in cands) / total_w
     dy = sum((c[3] - c[1]) * c[4] for c in cands) / total_w
@@ -196,16 +182,14 @@ def _robust_line(cands, mask):
     if Ld < 1e-6:
         return None
     dx, dy = dx / Ld, dy / Ld
-    if dy < 0:  # 统一朝下
+    if dy < 0:
         dx, dy = -dx, -dy
-    # 鲁棒位置：候选中点中位数
     mx = float(np.median([(c[0] + c[2]) / 2.0 for c in cands]))
     my = float(np.median([(c[1] + c[3]) / 2.0 for c in cands]))
 
     if mask is not None:
         p1, p2 = _extend_to_mask(mask, mx, my, dx, dy)
     else:
-        # 无箱子掩膜：沿方向取候选段投影的最远两端
         ts = []
         for (x1, y1, x2, y2, L) in cands:
             ts.append((x1 - mx) * dx + (y1 - my) * dy)
@@ -237,23 +221,81 @@ def _extend_to_mask(mask, mx, my, dx, dy, max_steps=4000):
     return p1, p2
 
 
-def _locate_edges(enhanced, p1, p2):
-    """沿骨架法向采样若干剖面，取两侧最强梯度峰定位胶带两条边缘。
+def _profile_along_normal(enhanced, cx, cy, nx, ny, half_i):
+    """在 (cx,cy) 沿法向采样灰度剖面，返回 (offsets, values) 或 (None, None)。"""
+    h, w = enhanced.shape
+    offsets = np.arange(-half_i, half_i + 1)
+    xs = cx + nx * offsets
+    ys = cy + ny * offsets
+    xi = np.round(xs).astype(int)
+    yi = np.round(ys).astype(int)
+    ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+    if ok.sum() < 5:
+        return None, None
+    return offsets[ok], enhanced[yi[ok], xi[ok]].astype(np.float32)
 
-    返回 (edge1_xy 平均, edge2_xy 平均, 平均宽度像素) 或 (None, None, 0)。
-    坐标系与 enhanced 一致（即降采样图）。
-    """
+
+def _crease_offset_in_profile(prof, offsets):
+    """在法向剖面内定位折线：优先取胶带两边缘之间的最暗点。"""
+    if prof is None or len(prof) < 5:
+        return None
+    grad = np.abs(np.gradient(prof))
+    mid = len(grad) // 2
+    if mid < 1 or mid >= len(grad) - 1:
+        return float(offsets[int(np.argmin(prof))])
+    a = int(np.argmax(grad[:mid]))
+    b = int(mid + np.argmax(grad[mid:]))
+    if grad[a] <= 0 or grad[b] <= 0 or b <= a + 1:
+        return float(offsets[int(np.argmin(prof))])
+    inner = prof[a:b + 1]
+    crease_i = a + int(np.argmin(inner))
+    return float(offsets[crease_i])
+
+
+def _refine_skeleton_to_crease(enhanced, p1, p2):
+    """沿法向把骨架从胶带边缘拉回到折线（压痕）最暗处。"""
+    if not config.CREASE_REFINE_ENABLED:
+        return p1, p2
+    x1, y1 = p1
+    x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    L = math.hypot(dx, dy)
+    if L < 1:
+        return p1, p2
+    tx, ty = dx / L, dy / L
+    nx, ny = -ty, tx
+    half_i = int(round(config.PROFILE_HALF_WIDTH * config.DETECT_SCALE))
+    max_shift = config.CREASE_REFINE_MAX_SHIFT
+    shifts = []
+    for s in np.linspace(0.15, 0.85, config.PROFILE_SAMPLES):
+        cx = x1 + s * dx
+        cy = y1 + s * dy
+        offs, prof = _profile_along_normal(enhanced, cx, cy, nx, ny, half_i)
+        if prof is None:
+            continue
+        off = _crease_offset_in_profile(prof, offs)
+        if off is not None:
+            shifts.append(off)
+    if len(shifts) < config.CREASE_REFINE_MIN_SAMPLES:
+        return p1, p2
+    shift = float(np.median(shifts))
+    shift = float(np.clip(shift, -max_shift, max_shift))
+    if abs(shift) < 0.3:
+        return p1, p2
+    return (x1 + nx * shift, y1 + ny * shift), (x2 + nx * shift, y2 + ny * shift)
+
+
+def _locate_edges(enhanced, p1, p2):
+    """沿骨架法向采样若干剖面，取两侧最强梯度峰定位胶带两条边缘。"""
     x1, y1 = p1
     x2, y2 = p2
     dx, dy = x2 - x1, y2 - y1
     L = math.hypot(dx, dy)
     if L < 1:
         return None, None, 0.0
-    tx, ty = dx / L, dy / L          # 沿骨架方向
-    nx, ny = -ty, tx                 # 法向
-    h, w = enhanced.shape
-    half = config.PROFILE_HALF_WIDTH * config.DETECT_SCALE
-    half_i = int(round(half))
+    tx, ty = dx / L, dy / L
+    nx, ny = -ty, tx
+    half_i = int(round(config.PROFILE_HALF_WIDTH * config.DETECT_SCALE))
     samples = config.PROFILE_SAMPLES
 
     e1_pts = []
@@ -262,18 +304,11 @@ def _locate_edges(enhanced, p1, p2):
     for s in np.linspace(0.15, 0.85, samples):
         cx = x1 + s * dx
         cy = y1 + s * dy
-        offsets = np.arange(-half_i, half_i + 1)
-        xs = cx + nx * offsets
-        ys = cy + ny * offsets
-        xi = np.round(xs).astype(int)
-        yi = np.round(ys).astype(int)
-        mask = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
-        if mask.sum() < 5:
+        offs, prof = _profile_along_normal(enhanced, cx, cy, nx, ny, half_i)
+        if prof is None:
             continue
-        prof = enhanced[yi[mask], xi[mask]].astype(np.float32)
         grad = np.abs(np.gradient(prof))
         mid = len(grad) // 2
-        # 左右两侧各取最强梯度峰
         if mid < 1 or mid >= len(grad) - 1:
             continue
         a = int(np.argmax(grad[:mid]))
@@ -283,8 +318,8 @@ def _locate_edges(enhanced, p1, p2):
         width_px = abs(b - a)
         if width_px < 2:
             continue
-        oa = offsets[a]
-        ob = offsets[b]
+        oa = float(offs[a])
+        ob = float(offs[b])
         e1_pts.append((cx + nx * oa, cy + ny * oa))
         e2_pts.append((cx + nx * ob, cy + ny * ob))
         widths.append(width_px)

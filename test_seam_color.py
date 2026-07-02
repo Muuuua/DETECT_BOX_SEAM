@@ -11,6 +11,7 @@ import numpy as np
 
 import box_detect
 from camera import D415Camera
+from seam_detect import _refine_skeleton_to_crease
 
 # ---- 基础检测参数 ----
 DETECT_SCALE = 0.5
@@ -341,6 +342,7 @@ def detect_seam_color_weighted(color_bgr, box, prev_skel=None):
         return None
 
     (sx1, sy1), (sx2, sy2) = skel_color
+    (sx1, sy1), (sx2, sy2) = _refine_skeleton_to_crease(enhanced, (sx1, sy1), (sx2, sy2))
     edge1_s, edge2_s, width_s = _locate_edges(enhanced, (sx1, sy1), (sx2, sy2))
     p1 = (sx1 * inv, sy1 * inv)
     p2 = (sx2 * inv, sy2 * inv)
