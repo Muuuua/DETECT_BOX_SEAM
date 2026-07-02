@@ -1,0 +1,5 @@
+# Python 3.10 推荐。安装前请先安装 Intel RealSense SDK 与 D415 驱动。
+pyrealsense2>=2.54.0
+opencv-python>=4.8.0
+numpy>=1.24.0,<2.0
+scikit-learn>=1.3.0
