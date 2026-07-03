@@ -61,7 +61,7 @@ CREASE_REFINE_MIN_SAMPLES = 5
 
 # ---- 平面拟合 ----
 RANSAC_RESIDUAL_MM = 2.0   # 内点阈值
-RANSAC_MAX_TRIALS = 100
+RANSAC_MAX_TRIALS = 50
 # 平面拟合 ROI 抽样步长（像素），越大越快越粗
 PLANE_STRIDE = 4
 # 平面拟合要求最少有效 3D 点数
